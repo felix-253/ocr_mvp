@@ -1,4 +1,5 @@
 import io
+import time
 from pathlib import Path
 from typing import Tuple, Dict, Any, Optional
 from PIL import Image
@@ -148,6 +149,7 @@ def process_vehicle_composition(
     model: str = "gemini-2.5-flash-image",
     cutout_prompt_file: str = "cutout.txt",
     composite_prompt_file: str = "composite_showroom.txt",
+    retries: int = 1,
 ) -> Dict[str, Any]:
     """
     Main function to process vehicle background removal and composition
@@ -162,9 +164,10 @@ def process_vehicle_composition(
         model: Gemini model name
         cutout_prompt_file: Name of cutout prompt file
         composite_prompt_file: Name of composite prompt file
+        retries: Number of retries per stage (cutout+composite). Total attempts = 1 + retries
     
     Returns:
-        Dictionary with cutout_image, composite_image (as bytes), and usage stats
+        Dictionary with cutout_image, composite_image (as bytes), usage stats, and errors
     """
     client = load_client()
     
@@ -179,25 +182,55 @@ def process_vehicle_composition(
     if reference_image_bytes:
         ref_mime = guess_mime_from_bytes(reference_image_bytes, reference_filename or "")
     
-    # Stage 1: Cutout (remove background)
-    cutout_img, cutout_usage = call_cutout(
-        client, model, cutout_prompt, car_image_bytes, car_mime
-    )
+    # Stage 1: Cutout (remove background) with retry logic
+    cutout_img = None
+    cutout_usage = None
+    cutout_err = None
+    
+    for attempt in range(1, 2 + retries):
+        try:
+            cutout_img, cutout_usage = call_cutout(
+                client, model, cutout_prompt, car_image_bytes, car_mime
+            )
+            cutout_err = None
+            break
+        except Exception as e:
+            cutout_err = str(e)
+            if attempt < (1 + retries):
+                time.sleep(0.7)  # Wait before retry
+    
+    if cutout_img is None:
+        raise RuntimeError(f"Cutout failed after {1 + retries} attempts: {cutout_err}")
     
     # Convert cutout to PNG bytes for composite
     cutout_png_bytes = pil_to_png_bytes(cutout_img)
     
-    # Stage 2: Composite
-    comp_img, comp_usage = call_composite(
-        client,
-        model,
-        composite_prompt,
-        background_image_bytes,
-        bg_mime,
-        cutout_png_bytes,
-        ref_bytes=reference_image_bytes,
-        ref_mime=ref_mime,
-    )
+    # Stage 2: Composite with retry logic
+    comp_img = None
+    comp_usage = None
+    comp_err = None
+    
+    for attempt in range(1, 2 + retries):
+        try:
+            comp_img, comp_usage = call_composite(
+                client,
+                model,
+                composite_prompt,
+                background_image_bytes,
+                bg_mime,
+                cutout_png_bytes,
+                ref_bytes=reference_image_bytes,
+                ref_mime=ref_mime,
+            )
+            comp_err = None
+            break
+        except Exception as e:
+            comp_err = str(e)
+            if attempt < (1 + retries):
+                time.sleep(0.7)  # Wait before retry
+    
+    if comp_img is None:
+        raise RuntimeError(f"Composite failed after {1 + retries} attempts: {comp_err}")
     
     # Convert results to bytes
     cutout_bytes = pil_to_png_bytes(cutout_img)
@@ -208,4 +241,6 @@ def process_vehicle_composition(
         "composite_image": composite_bytes,
         "cutout_usage": cutout_usage,
         "composite_usage": comp_usage,
+        "cutout_error": cutout_err,
+        "composite_error": comp_err,
     }

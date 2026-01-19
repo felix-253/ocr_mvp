@@ -12,15 +12,13 @@ from datetime import datetime
 from pathlib import Path
 import httpx
 from urllib.parse import urlencode
+from PIL import Image
 from app.config import *
 
 
 class SeriesSelection(BaseModel):
-    vehicle_number: str
-    owner_name: Optional[str] = ""
-    series: Optional[str] = ""
-    seriesname1: Optional[str] = ""
-    seriesname2: Optional[str] = ""
+    seriesno: str
+    ts_key: str
 
 
 app = FastAPI(title=os.getenv("APP_NAME","OCR"))
@@ -76,6 +74,68 @@ async def scan_certificate(file: UploadFile = File(...)):
         with open(file_location, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
+        # Preprocess image before OCR: crop, scale, and enhance for Korean text recognition
+        try:
+            img = Image.open(file_location)
+            original_width, original_height = img.size
+            print(f"Original image size: {original_width}x{original_height}")
+            
+            # Step 1: Crop image if large enough
+            if original_width >= 1100 and original_height >= 600:
+                # Crop: left, top, right, bottom
+                img = img.crop((0, 0, 1100, 600))
+                print(f"Image cropped to: 1100x600")
+            else:
+                # If image is smaller, use actual dimensions but still process
+                crop_width = min(1100, original_width)
+                crop_height = min(600, original_height)
+                img = img.crop((0, 0, crop_width, crop_height))
+                print(f"Image size ({original_width}x{original_height}) is smaller than crop size, cropped to: {crop_width}x{crop_height}")
+            
+            # Step 2: Scale image up 1.2x for better OCR accuracy
+            scale_factor = 1.2
+            new_width = int(img.width * scale_factor)
+            new_height = int(img.height * scale_factor)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            print(f"Image scaled to: {new_width}x{new_height}")
+            
+            # Step 3: Enhance image for Korean text clarity
+            # Convert to RGB if needed
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Apply sharpening filter to make Korean characters clearer
+            from PIL import ImageFilter, ImageEnhance
+            img = img.filter(ImageFilter.SHARPEN)
+            
+            # Enhance contrast to improve Korean text visibility
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(1.2)  # Increase contrast by 20%
+            
+            # Enhance sharpness further for Korean characters
+            enhancer = ImageEnhance.Sharpness(img)
+            img = enhancer.enhance(1.2)  # Increase sharpness by 30%
+            
+            # Save preprocessed image (overwrite original)
+            # Ensure the directory exists
+            os.makedirs(os.path.dirname(file_location), exist_ok=True)
+            
+            # Save with explicit format
+            img.save(file_location, format='JPEG', quality=95, optimize=True)
+            
+            # Verify file was saved
+            if os.path.exists(file_location):
+                file_size = os.path.getsize(file_location)
+                print(f"✓ Image preprocessed and saved successfully: {new_width}x{new_height}, file: {file_location}, size: {file_size} bytes")
+            else:
+                print(f"✗ ERROR: File was not saved: {file_location}")
+            
+        except Exception as preprocess_error:
+            # If preprocessing fails, log error but continue with original image
+            print(f"Error: Image preprocessing failed: {preprocess_error}")
+            import traceback
+            traceback.print_exc()
+        
         # Run OCR pipeline
         ocr_result = run_ocr_pipeline(file_location)
         
@@ -98,22 +158,21 @@ async def scan_certificate(file: UploadFile = File(...)):
                 "ocr_result": ocr_result
             }
         
-        # Call Autobegin API
-        autobegin_url = os.getenv("AUTOBEGINS_URL", "")
-        autobegin_key = os.getenv("AUTOBEGINS_KEY", "")
+        # Call new Autobegin API via vsol.hanbirosoft.com
+        autobegin_base_url = os.getenv("AUTOBEGIN_BASE_URL", "http://vsol.hanbirosoft.com/api/autobegin")
+        autobegin_token = os.getenv("AUTOBEGIN_BEARER_TOKEN", "")
         
-        if not autobegin_url or not autobegin_key:
+        if not autobegin_token:
             return {
                 "success": False,
-                "error": "Autobegin API configuration missing (AUTOBEGINS_URL, AUTOBEGINS_KEY)",
+                "error": "Autobegin API bearer token missing (AUTOBEGIN_BEARER_TOKEN)",
                 "ocr_result": ocr_result
             }
         
-        # Prepare query parameters
+        # Prepare query parameters for search API
         query_params = {
-            "key": autobegin_key,
             "mode": "search",
-            "carName": vehicle_number,  # Using vehicle_number as carName
+            "carNum": vehicle_number,
         }
         
         # Add owner if available
@@ -121,18 +180,32 @@ async def scan_certificate(file: UploadFile = File(...)):
             query_params["owner"] = owner_name
         
         # Build URL with query parameters
-        url = f"{autobegin_url}?{urlencode(query_params)}"
+        url = f"{autobegin_base_url}/search?{urlencode(query_params)}"
         
-        # Call Autobegin API
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        # Call new Autobegin API with bearer token (very long timeout: 5 minutes)
+        timeout_config = httpx.Timeout(300.0, connect=60.0)  # 5 minutes total, 60s connect
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             try:
                 response = await client.get(
                     url,
-                    headers={"Content-Type": "application/json"}
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {autobegin_token}"
+                    }
                 )
                 response.raise_for_status()
-                autobegin_data = response.json()
-                print("autobegin_data",response.json())
+                api_response = response.json()
+                print("autobegin_api_response", api_response)
+                
+                # Extract data from response (format: {"success": true, "data": {...}})
+                if not api_response.get("success", False):
+                    return {
+                        "success": False,
+                        "error": api_response.get("message", "API returned unsuccessful response"),
+                        "ocr_result": ocr_result
+                    }
+                
+                autobegin_data = api_response.get("data", {})
             except httpx.HTTPError as e:
                 return {
                     "success": False,
@@ -182,21 +255,44 @@ async def scan_certificate(file: UploadFile = File(...)):
                 "seriesname2": seriesname2,
                 "newprice": cardata.get("newprice"),
                 "firstdate": cardata.get("firstdate"),
-                # Additional fields from cardata
-                "chassis_number": cardata.get("chassis_number") or cardata.get("chassisnumber"),
+                "year": cardata.get("year"),
+                # Additional fields from cardata (new API format)
+                "chassis_number": cardata.get("vin") or cardata.get("chassis_number") or cardata.get("chassisnumber"),
+                "vin": cardata.get("vin"),
                 "engine_type": cardata.get("engine_type") or cardata.get("enginetype"),
+                "displacement": cardata.get("displacement"),
                 "fuel": cardata.get("fuel"),
                 "color": cardata.get("color"),
-                "purpose": cardata.get("purpose"),
+                "purpose": cardata.get("usegubun") or cardata.get("purpose"),
+                "seating": cardata.get("seating"),
+                "carnum": cardata.get("carnum"),
+                "regname": cardata.get("regname"),
                 "full_data": cardata
             }
             
         elif rst_code == 2:
             # Multiple series found: Return list for user to select
-            # The response should contain a list of series options
-            series_list = autobegin_data.get("series_list", [])
-            result["message"] = "Multiple series found. Please select a series."
+            # Extract modellist and serieslist from response
+            modellist = autobegin_data.get("modellist", [])
+            ts_key = autobegin_data.get("ts_key", "")
+            
+            # Flatten series list from all models
+            series_list = []
+            for model in modellist:
+                model_series_list = model.get("serieslist", [])
+                for series in model_series_list:
+                    series_list.append({
+                        "modelno": model.get("modelno"),
+                        "modelname": model.get("modelname"),
+                        "seriesno": series.get("seriesno"),
+                        "seriesname": series.get("seriesname"),
+                        "seriesprice": series.get("seriesprice")
+                    })
+            
+            result["message"] = autobegin_data.get("rst_msg", "Multiple series found. Please select a series.")
             result["series_list"] = series_list
+            result["modellist"] = modellist
+            result["ts_key"] = ts_key
             result["requires_selection"] = True
             
         else:
@@ -212,8 +308,8 @@ async def scan_certificate(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # Clean up uploaded file
-        if os.path.exists(file_location):
-            os.remove(file_location)
+        # if os.path.exists(file_location):
+        #     os.remove(file_location)
             print("DELETE FILE", file_location)
 
 
@@ -223,59 +319,62 @@ async def scan_certificate_select_series(selection: SeriesSelection = Body(...))
     After getting rst_code=2, call this endpoint with selected series to get full vehicle details.
     
     Request body:
-    - **vehicle_number**: Vehicle registration number (required)
-    - **owner_name**: Owner name (optional)
-    - **series**: Selected series name (optional)
-    - **seriesname1**: Series name part 1 (optional)
-    - **seriesname2**: Series name part 2 (optional)
+    - **seriesno**: Selected series number (required)
+    - **ts_key**: Transaction key from previous response (required)
     """
     try:
-        vehicle_number = selection.vehicle_number
-        owner_name = selection.owner_name or ""
-        series = selection.series or ""
-        seriesname1 = selection.seriesname1 or ""
-        seriesname2 = selection.seriesname2 or ""
-        # Call Autobegin API
-        autobegin_url = os.getenv("AUTOBEGINS_URL", "")
-        autobegin_key = os.getenv("AUTOBEGINS_KEY", "")
+        seriesno = selection.seriesno
+        ts_key = selection.ts_key
         
-        if not autobegin_url or not autobegin_key:
+        if not seriesno or not ts_key:
             return {
                 "success": False,
-                "error": "Autobegin API configuration missing (AUTOBEGINS_URL, AUTOBEGINS_KEY)"
+                "error": "seriesno and ts_key are required"
             }
         
-        # Prepare query parameters
+        # Call new Autobegin API via vsol.hanbirosoft.com
+        autobegin_base_url = os.getenv("AUTOBEGIN_BASE_URL", "http://vsol.hanbirosoft.com/api/autobegin")
+        autobegin_token = os.getenv("AUTOBEGIN_BEARER_TOKEN", "")
+        
+        if not autobegin_token:
+            return {
+                "success": False,
+                "error": "Autobegin API bearer token missing (AUTOBEGIN_BEARER_TOKEN)"
+            }
+        
+        # Prepare query parameters for detail API
         query_params = {
-            "key": autobegin_key,
-            "mode": "search",
-            "carName": vehicle_number,
+            "mode": "detail",
+            "seriesno": seriesno,
+            "ts_key": ts_key,
         }
         
-        # Add owner if available
-        if owner_name:
-            query_params["owner"] = owner_name
-        
-        # Add series selection
-        if series:
-            query_params["series"] = series
-        if seriesname1:
-            query_params["seriesname1"] = seriesname1
-        if seriesname2:
-            query_params["seriesname2"] = seriesname2
-        
         # Build URL with query parameters
-        url = f"{autobegin_url}?{urlencode(query_params)}"
+        url = f"{autobegin_base_url}/search?{urlencode(query_params)}"
         
-        # Call Autobegin API
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        # Call new Autobegin API with bearer token (very long timeout: 5 minutes)
+        timeout_config = httpx.Timeout(300.0, connect=60.0)  # 5 minutes total, 60s connect
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             try:
                 response = await client.get(
                     url,
-                    headers={"Content-Type": "application/json"}
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {autobegin_token}"
+                    }
                 )
                 response.raise_for_status()
-                autobegin_data = response.json()
+                api_response = response.json()
+                print("autobegin_detail_api_response", api_response)
+                
+                # Extract data from response (format: {"success": true, "data": {...}})
+                if not api_response.get("success", False):
+                    return {
+                        "success": False,
+                        "error": api_response.get("message", "API returned unsuccessful response")
+                    }
+                
+                autobegin_data = api_response.get("data", {})
             except httpx.HTTPError as e:
                 return {
                     "success": False,
@@ -287,8 +386,6 @@ async def scan_certificate_select_series(selection: SeriesSelection = Body(...))
         
         result = {
             "success": True,
-            "vehicle_number": vehicle_number,
-            "owner_name": owner_name,
             "autobegin_data": autobegin_data,
             "rst_code": rst_code
         }
@@ -323,20 +420,43 @@ async def scan_certificate_select_series(selection: SeriesSelection = Body(...))
                 "seriesname2": seriesname2,
                 "newprice": cardata.get("newprice"),
                 "firstdate": cardata.get("firstdate"),
-                # Additional fields from cardata
-                "chassis_number": cardata.get("chassis_number") or cardata.get("chassisnumber"),
+                "year": cardata.get("year"),
+                # Additional fields from cardata (new API format)
+                "chassis_number": cardata.get("vin") or cardata.get("chassis_number") or cardata.get("chassisnumber"),
+                "vin": cardata.get("vin"),
                 "engine_type": cardata.get("engine_type") or cardata.get("enginetype"),
+                "displacement": cardata.get("displacement"),
                 "fuel": cardata.get("fuel"),
                 "color": cardata.get("color"),
-                "purpose": cardata.get("purpose"),
+                "purpose": cardata.get("usegubun") or cardata.get("purpose"),
+                "seating": cardata.get("seating"),
+                "carnum": cardata.get("carnum"),
+                "regname": cardata.get("regname"),
                 "full_data": cardata
             }
             
         elif rst_code == 2:
-            # Still multiple series found
-            series_list = autobegin_data.get("series_list", [])
-            result["message"] = "Multiple series found. Please select a series."
+            # Still multiple series found (should not happen after selecting series, but handle it)
+            modellist = autobegin_data.get("modellist", [])
+            ts_key = autobegin_data.get("ts_key", "")
+            
+            # Flatten series list from all models
+            series_list = []
+            for model in modellist:
+                model_series_list = model.get("serieslist", [])
+                for series in model_series_list:
+                    series_list.append({
+                        "modelno": model.get("modelno"),
+                        "modelname": model.get("modelname"),
+                        "seriesno": series.get("seriesno"),
+                        "seriesname": series.get("seriesname"),
+                        "seriesprice": series.get("seriesprice")
+                    })
+            
+            result["message"] = autobegin_data.get("rst_msg", "Multiple series found. Please select a series.")
             result["series_list"] = series_list
+            result["modellist"] = modellist
+            result["ts_key"] = ts_key
             result["requires_selection"] = True
             
         else:
@@ -362,6 +482,7 @@ async def vehicle_composition(
     composite_prompt: str = "composite_showroom.txt",
     return_cutout: bool = True,
     return_composite: bool = True,
+    retries: int = 1,
 ):
     """
     Process vehicle background removal and composition.
@@ -374,6 +495,7 @@ async def vehicle_composition(
     - **composite_prompt**: Name of composite prompt file (default: composite_showroom.txt)
     - **return_cutout**: Whether to return cutout image (default: True)
     - **return_composite**: Whether to return composite image (default: True)
+    - **retries**: Number of retries per stage (default: 1, total attempts = 1 + retries)
     
     Returns JSON with image data (base64 or bytes) and usage statistics.
     """
@@ -404,6 +526,7 @@ async def vehicle_composition(
             model=model,
             cutout_prompt_file=cutout_prompt,
             composite_prompt_file=composite_prompt,
+            retries=retries,
         )
         
         # Save images to debug directory
@@ -439,6 +562,12 @@ async def vehicle_composition(
             "composite_usage": result["composite_usage"],
             "saved_files": saved_files,
         }
+        
+        # Add errors if any (for debugging)
+        if result.get("cutout_error"):
+            response_data["cutout_error"] = result["cutout_error"]
+        if result.get("composite_error"):
+            response_data["composite_error"] = result["composite_error"]
         
         # Add images if requested (base64 encoded for JSON response)
         if return_cutout:
