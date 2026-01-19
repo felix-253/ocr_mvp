@@ -1,0 +1,20 @@
+You will receive ONE car image.
+
+Goal:
+- Remove the background and keep ONLY the car.
+- Output a clean cutout (car with transparent background).
+
+STRICT RULES:
+- Preserve the exact car identity (model, shape, trim, color, rims, windows, badges).
+- Preserve ALL text exactly as in the input (especially the license plate). Do not modify, translate, or regenerate text.
+- Do NOT change viewpoint, perspective, or camera angle.
+- Do NOT add or remove parts (no extra spoiler, no different wheels).
+- No blur, no repainting, no stylization.
+
+MASK QUALITY:
+- Keep fine details: mirrors, antennas, wipers, thin edges.
+- Smooth edges without jagged halos. No background color spill.
+- Keep original shadows on the car body only if they belong to the car itself; do not keep ground shadow from the original background.
+
+OUTPUT FORMAT:
+- Return a single PNG with transparent background (RGBA).

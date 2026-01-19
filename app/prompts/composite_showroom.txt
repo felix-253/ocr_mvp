@@ -1,0 +1,32 @@
+You are doing IMAGE EDITING / COMPOSITING, not generating a new car.
+
+Goal:
+Composite the exact same car from Image A onto the showroom background Image B.
+Use Image C ONLY as a framing/placement guide (red box). Do NOT copy any car from Image C.
+
+Hard constraints (must):
+- Keep the car identity EXACTLY: same make/model/body, same color, same wheels, same windows, same reflections pattern.
+- Preserve the original camera angle/perspective of the car from Image A (do NOT rotate to front view).
+- Do NOT change or hallucinate text/logos/plates. Keep the license plate exactly as in Image A (no edits, no new numbers).
+- Place the car so that it fits the red guide box in Image C:
+  - The car should occupy ~80–90% of the guide box width.
+  - The car should be centered horizontally on the guide box center.
+  - Wheels must touch the floor (no floating).
+- Keep Image B background unchanged except for realistic contact shadow under tires and subtle reflection on the floor.
+
+Soft constraints (nice):
+- Match lighting color temperature and contrast to Image B.
+- Add realistic soft shadow under each tire and a faint floor reflection consistent with the showroom.
+
+Must NOT:
+- Do NOT create a different vehicle.
+- Do NOT change body proportions.
+- Do NOT add extra objects, text, watermarks, or modify the background geometry.
+
+Return only the final composited image.
+The car must not look far away. It must appear close to the camera like a dealership photo and fill the scene.
+Do NOT change the viewing angle. Keep the exact yaw/pitch/roll of the car from Image A.
+License plate must be preserved exactly from Image A. Do not regenerate, translate, blur, or modify it.
+Alignment rules:
+- Vertical centerline: the midpoint between the front wheels should be centered.
+- Ground contact line: both tires must touch the floor plane; no gaps.
