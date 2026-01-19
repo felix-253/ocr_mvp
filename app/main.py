@@ -1,14 +1,26 @@
-from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException
+from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Body
 from fastapi.responses import Response
 from app.ocr_engine import run_ocr_pipeline
 from app.vehicle_composition_service import process_vehicle_composition
+from pydantic import BaseModel
+from typing import Optional
 import os 
 import shutil
 import base64
 import uuid
 from datetime import datetime
 from pathlib import Path
+import httpx
+from urllib.parse import urlencode
 from app.config import *
+
+
+class SeriesSelection(BaseModel):
+    vehicle_number: str
+    owner_name: Optional[str] = ""
+    series: Optional[str] = ""
+    seriesname1: Optional[str] = ""
+    seriesname2: Optional[str] = ""
 
 
 app = FastAPI(title=os.getenv("APP_NAME","OCR"))
@@ -44,6 +56,300 @@ async def fileCertificate(file: UploadFile=File(...)):
                         os.remove(file_location)
                         print("DELETE FILE",file_location)
                 pass
+
+
+@app_router.post('/scan-certificate')
+async def scan_certificate(file: UploadFile = File(...)):
+    """
+    Scan vehicle registration certificate, extract vehicle number and owner name,
+    then query Autobegin API for vehicle information.
+    
+    Returns OCR results and Autobegin vehicle data.
+    """
+    base_dir = f"./data/uploads"
+    os.makedirs(base_dir, exist_ok=True)
+    
+    file_location = f"{base_dir}/{file.filename}"
+    
+    try:
+        # Save uploaded file
+        with open(file_location, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Run OCR pipeline
+        ocr_result = run_ocr_pipeline(file_location)
+        
+        if "error" in ocr_result.get("data", {}):
+            return {
+                "success": False,
+                "error": ocr_result["data"]["error"],
+                "ocr_result": ocr_result
+            }
+        
+        # Extract vehicle_number and owner_name from OCR result
+        ocr_data = ocr_result.get("data", {})
+        vehicle_number = ocr_data.get("vehicle_number", {}).get("value", "")
+        owner_name = ocr_data.get("owner_name", {}).get("value", "")
+        
+        if not vehicle_number:
+            return {
+                "success": False,
+                "error": "Vehicle number not found in OCR result",
+                "ocr_result": ocr_result
+            }
+        
+        # Call Autobegin API
+        autobegin_url = os.getenv("AUTOBEGINS_URL", "")
+        autobegin_key = os.getenv("AUTOBEGINS_KEY", "")
+        
+        if not autobegin_url or not autobegin_key:
+            return {
+                "success": False,
+                "error": "Autobegin API configuration missing (AUTOBEGINS_URL, AUTOBEGINS_KEY)",
+                "ocr_result": ocr_result
+            }
+        
+        # Prepare query parameters
+        query_params = {
+            "key": autobegin_key,
+            "mode": "search",
+            "carName": vehicle_number,  # Using vehicle_number as carName
+        }
+        
+        # Add owner if available
+        if owner_name:
+            query_params["owner"] = owner_name
+        
+        # Build URL with query parameters
+        url = f"{autobegin_url}?{urlencode(query_params)}"
+        
+        # Call Autobegin API
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                response = await client.get(
+                    url,
+                    headers={"Content-Type": "application/json"}
+                )
+                response.raise_for_status()
+                autobegin_data = response.json()
+                print("autobegin_data",response.json())
+            except httpx.HTTPError as e:
+                return {
+                    "success": False,
+                    "error": f"Autobegin API error: {str(e)}",
+                    "ocr_result": ocr_result
+                }
+        
+        # Process Autobegin response based on rst_code
+        rst_code = autobegin_data.get("rst_code")
+        
+        result = {
+            "success": True,
+            "ocr_result": ocr_result,
+            "vehicle_number": vehicle_number,
+            "owner_name": owner_name,
+            "autobegin_data": autobegin_data,
+            "rst_code": rst_code
+        }
+        
+        # Handle different rst_code values
+        if rst_code == 1:
+            # Success: Full vehicle information available
+            cardata = autobegin_data.get("cardata", {})
+            
+            # Extract vehicle information
+            makername = cardata.get("makername", "")
+            classname = cardata.get("classname", "")
+            modelname = cardata.get("modelname", "")
+            seriesname = cardata.get("seriesname", "")
+            seriesname1 = cardata.get("seriesname1", "")
+            seriesname2 = cardata.get("seriesname2", "")
+            
+            # Build car type
+            series_part = f"{seriesname1}_{seriesname2}" if (seriesname1 and seriesname2) else seriesname
+            car_type_parts = [makername, classname, modelname, series_part]
+            # Filter out empty strings and join
+            car_type = "_".join(filter(None, car_type_parts)).strip("_") if any(car_type_parts) else None
+            
+            # Add formatted data to result
+            result["vehicle_info"] = {
+                "car_type": car_type,
+                "makername": makername,
+                "classname": classname,
+                "modelname": modelname,
+                "seriesname": seriesname,
+                "seriesname1": seriesname1,
+                "seriesname2": seriesname2,
+                "newprice": cardata.get("newprice"),
+                "firstdate": cardata.get("firstdate"),
+                # Additional fields from cardata
+                "chassis_number": cardata.get("chassis_number") or cardata.get("chassisnumber"),
+                "engine_type": cardata.get("engine_type") or cardata.get("enginetype"),
+                "fuel": cardata.get("fuel"),
+                "color": cardata.get("color"),
+                "purpose": cardata.get("purpose"),
+                "full_data": cardata
+            }
+            
+        elif rst_code == 2:
+            # Multiple series found: Return list for user to select
+            # The response should contain a list of series options
+            series_list = autobegin_data.get("series_list", [])
+            result["message"] = "Multiple series found. Please select a series."
+            result["series_list"] = series_list
+            result["requires_selection"] = True
+            
+        else:
+            # Error: rst_code is not 1 or 2
+            error_message = autobegin_data.get("rst_msg", f"Unknown error (rst_code: {rst_code})")
+            result["success"] = False
+            result["error"] = error_message
+            result["message"] = f"Autobegin API returned error: {error_message}"
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up uploaded file
+        if os.path.exists(file_location):
+            os.remove(file_location)
+            print("DELETE FILE", file_location)
+
+
+@app_router.post('/scan-certificate/select-series')
+async def scan_certificate_select_series(selection: SeriesSelection = Body(...)):
+    """
+    After getting rst_code=2, call this endpoint with selected series to get full vehicle details.
+    
+    Request body:
+    - **vehicle_number**: Vehicle registration number (required)
+    - **owner_name**: Owner name (optional)
+    - **series**: Selected series name (optional)
+    - **seriesname1**: Series name part 1 (optional)
+    - **seriesname2**: Series name part 2 (optional)
+    """
+    try:
+        vehicle_number = selection.vehicle_number
+        owner_name = selection.owner_name or ""
+        series = selection.series or ""
+        seriesname1 = selection.seriesname1 or ""
+        seriesname2 = selection.seriesname2 or ""
+        # Call Autobegin API
+        autobegin_url = os.getenv("AUTOBEGINS_URL", "")
+        autobegin_key = os.getenv("AUTOBEGINS_KEY", "")
+        
+        if not autobegin_url or not autobegin_key:
+            return {
+                "success": False,
+                "error": "Autobegin API configuration missing (AUTOBEGINS_URL, AUTOBEGINS_KEY)"
+            }
+        
+        # Prepare query parameters
+        query_params = {
+            "key": autobegin_key,
+            "mode": "search",
+            "carName": vehicle_number,
+        }
+        
+        # Add owner if available
+        if owner_name:
+            query_params["owner"] = owner_name
+        
+        # Add series selection
+        if series:
+            query_params["series"] = series
+        if seriesname1:
+            query_params["seriesname1"] = seriesname1
+        if seriesname2:
+            query_params["seriesname2"] = seriesname2
+        
+        # Build URL with query parameters
+        url = f"{autobegin_url}?{urlencode(query_params)}"
+        
+        # Call Autobegin API
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                response = await client.get(
+                    url,
+                    headers={"Content-Type": "application/json"}
+                )
+                response.raise_for_status()
+                autobegin_data = response.json()
+            except httpx.HTTPError as e:
+                return {
+                    "success": False,
+                    "error": f"Autobegin API error: {str(e)}"
+                }
+        
+        # Process Autobegin response
+        rst_code = autobegin_data.get("rst_code")
+        
+        result = {
+            "success": True,
+            "vehicle_number": vehicle_number,
+            "owner_name": owner_name,
+            "autobegin_data": autobegin_data,
+            "rst_code": rst_code
+        }
+        
+        # Handle different rst_code values
+        if rst_code == 1:
+            # Success: Full vehicle information available
+            cardata = autobegin_data.get("cardata", {})
+            
+            # Extract vehicle information
+            makername = cardata.get("makername", "")
+            classname = cardata.get("classname", "")
+            modelname = cardata.get("modelname", "")
+            seriesname = cardata.get("seriesname", "")
+            seriesname1 = cardata.get("seriesname1", "")
+            seriesname2 = cardata.get("seriesname2", "")
+            
+            # Build car type
+            series_part = f"{seriesname1}_{seriesname2}" if (seriesname1 and seriesname2) else seriesname
+            car_type_parts = [makername, classname, modelname, series_part]
+            # Filter out empty strings and join
+            car_type = "_".join(filter(None, car_type_parts)).strip("_") if any(car_type_parts) else None
+            
+            # Add formatted data to result
+            result["vehicle_info"] = {
+                "car_type": car_type,
+                "makername": makername,
+                "classname": classname,
+                "modelname": modelname,
+                "seriesname": seriesname,
+                "seriesname1": seriesname1,
+                "seriesname2": seriesname2,
+                "newprice": cardata.get("newprice"),
+                "firstdate": cardata.get("firstdate"),
+                # Additional fields from cardata
+                "chassis_number": cardata.get("chassis_number") or cardata.get("chassisnumber"),
+                "engine_type": cardata.get("engine_type") or cardata.get("enginetype"),
+                "fuel": cardata.get("fuel"),
+                "color": cardata.get("color"),
+                "purpose": cardata.get("purpose"),
+                "full_data": cardata
+            }
+            
+        elif rst_code == 2:
+            # Still multiple series found
+            series_list = autobegin_data.get("series_list", [])
+            result["message"] = "Multiple series found. Please select a series."
+            result["series_list"] = series_list
+            result["requires_selection"] = True
+            
+        else:
+            # Error: rst_code is not 1 or 2
+            error_message = autobegin_data.get("rst_msg", f"Unknown error (rst_code: {rst_code})")
+            result["success"] = False
+            result["error"] = error_message
+            result["message"] = f"Autobegin API returned error: {error_message}"
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app_router.post('/vehicle-composition')
