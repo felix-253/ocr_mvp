@@ -189,14 +189,8 @@ async def scan_certificate(file: UploadFile = File(...)):
         
         # Call new Autobegin API via vsol.hanbirosoft.com
         autobegin_base_url = os.getenv("AUTOBEGIN_BASE_URL", "http://vsol.hanbirosoft.com/api/autobegin")
-        autobegin_token = os.getenv("AUTOBEGIN_BEARER_TOKEN", "")
         
-        if not autobegin_token:
-            return {
-                "success": False,
-                "error": "Autobegin API bearer token missing (AUTOBEGIN_BEARER_TOKEN)",
-                "ocr_result": ocr_result
-            }
+       
         
         # Prepare query parameters for search API
         query_params = {
@@ -219,7 +213,6 @@ async def scan_certificate(file: UploadFile = File(...)):
                     url,
                     headers={
                         "Content-Type": "application/json",
-                        "Authorization": f"Bearer {autobegin_token}"
                     }
                 )
                 response.raise_for_status()
@@ -371,13 +364,8 @@ async def scan_certificate_select_series(selection: SeriesSelection = Body(...))
         
         # Call new Autobegin API via vsol.hanbirosoft.com
         autobegin_base_url = os.getenv("AUTOBEGIN_BASE_URL", "http://vsol.hanbirosoft.com/api/autobegin")
-        autobegin_token = os.getenv("AUTOBEGIN_BEARER_TOKEN", "")
         
-        if not autobegin_token:
-            return {
-                "success": False,
-                "error": "Autobegin API bearer token missing (AUTOBEGIN_BEARER_TOKEN)"
-            }
+        
         
         # Prepare query parameters for detail API
         query_params = {
@@ -397,7 +385,6 @@ async def scan_certificate_select_series(selection: SeriesSelection = Body(...))
                     url,
                     headers={
                         "Content-Type": "application/json",
-                        "Authorization": f"Bearer {autobegin_token}"
                     }
                 )
                 response.raise_for_status()
