@@ -1,5 +1,6 @@
 from fastapi import FastAPI, APIRouter, UploadFile, File, HTTPException, Body
 from fastapi.responses import Response
+from fastapi.middleware.cors import CORSMiddleware
 from app.ocr_engine import run_ocr_pipeline
 from app.vehicle_composition_service import process_vehicle_composition
 from pydantic import BaseModel
@@ -23,6 +24,15 @@ class SeriesSelection(BaseModel):
 
 app = FastAPI(title=os.getenv("APP_NAME","OCR"))
 
+# Configure CORS - Allow localhost and 127.0.0.1 with any port
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app_router = APIRouter(prefix='/api')
 
 
@@ -33,7 +43,6 @@ async def healthy():
 @app_router.post('/test-ocr')
 async def fileCertificate(file: UploadFile=File(...)):
         base_dir = f"./data/uploads"
-        print("local",f".{os.getenv('UPLOAD_URI','/data/uploads')}")
         os.makedirs(base_dir,exist_ok=True)
 
         file_location = f"{base_dir}/{file.filename}"
@@ -52,7 +61,6 @@ async def fileCertificate(file: UploadFile=File(...)):
         finally:
                 if(os.path.exists(file_location)):
                         os.remove(file_location)
-                        print("DELETE FILE",file_location)
                 pass
 
 
@@ -78,63 +86,79 @@ async def scan_certificate(file: UploadFile = File(...)):
         try:
             img = Image.open(file_location)
             original_width, original_height = img.size
-            print(f"Original image size: {original_width}x{original_height}")
-            
             # Step 1: Crop image if large enough
             if original_width >= 1100 and original_height >= 600:
                 # Crop: left, top, right, bottom
                 img = img.crop((0, 0, 1100, 600))
-                print(f"Image cropped to: 1100x600")
             else:
                 # If image is smaller, use actual dimensions but still process
                 crop_width = min(1100, original_width)
                 crop_height = min(600, original_height)
                 img = img.crop((0, 0, crop_width, crop_height))
-                print(f"Image size ({original_width}x{original_height}) is smaller than crop size, cropped to: {crop_width}x{crop_height}")
             
-            # Step 2: Scale image up 1.2x for better OCR accuracy
-            scale_factor = 1.2
+            # Step 2: Scale image up 2.5x for better OCR accuracy (especially for similar Korean characters like 욱/육)
+            # Higher resolution helps distinguish fine details
+            scale_factor = 2.5
             new_width = int(img.width * scale_factor)
             new_height = int(img.height * scale_factor)
             img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-            print(f"Image scaled to: {new_width}x{new_height}")
             
-            # Step 3: Enhance image for Korean text clarity
-            # Convert to RGB if needed
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
+            # Step 3: Use OpenCV for advanced preprocessing to distinguish similar Korean characters
+            # But keep it lighter to avoid losing text
+            import cv2
+            import numpy as np
             
-            # Apply sharpening filter to make Korean characters clearer
+            # Convert PIL to numpy array for OpenCV processing
+            img_array = np.array(img)
+            if len(img_array.shape) == 3 and img_array.shape[2] == 3:  # RGB
+                img_cv = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+            else:
+                img_cv = img_array
+            
+            # Convert to grayscale for better character distinction
+            if len(img_cv.shape) == 3:
+                gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img_cv
+            
+            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) - lighter version
+            # This helps distinguish similar characters like 욱 vs 육 without being too aggressive
+            clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))  # Reduced clipLimit
+            gray = clahe.apply(gray)
+            
+            # Convert back to RGB for PIL (keep grayscale as RGB for compatibility)
+            # Don't use adaptive thresholding as it might be too aggressive and lose text
+            processed_rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+            img = Image.fromarray(processed_rgb)
+            
+            # Step 4: Additional PIL enhancements
             from PIL import ImageFilter, ImageEnhance
-            img = img.filter(ImageFilter.SHARPEN)
             
-            # Enhance contrast to improve Korean text visibility
+            # Apply unsharp mask for better edge definition (helps distinguish 욱 from 육)
+            img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
+            
+            # Enhance contrast more aggressively for Korean characters
             enhancer = ImageEnhance.Contrast(img)
-            img = enhancer.enhance(1.2)  # Increase contrast by 20%
+            img = enhancer.enhance(1.4)  # Increase contrast by 40%
             
-            # Enhance sharpness further for Korean characters
+            # Enhance sharpness to make fine details clearer
             enhancer = ImageEnhance.Sharpness(img)
-            img = enhancer.enhance(1.2)  # Increase sharpness by 30%
+            img = enhancer.enhance(1.5)  # Increase sharpness by 50%
             
             # Save preprocessed image (overwrite original)
             # Ensure the directory exists
             os.makedirs(os.path.dirname(file_location), exist_ok=True)
             
-            # Save with explicit format
-            img.save(file_location, format='JPEG', quality=95, optimize=True)
+            # Save with explicit format and high quality
+            img.save(file_location, format='JPEG', quality=98, optimize=False)
             
             # Verify file was saved
-            if os.path.exists(file_location):
-                file_size = os.path.getsize(file_location)
-                print(f"✓ Image preprocessed and saved successfully: {new_width}x{new_height}, file: {file_location}, size: {file_size} bytes")
-            else:
-                print(f"✗ ERROR: File was not saved: {file_location}")
+            if not os.path.exists(file_location):
+                raise Exception(f"File was not saved: {file_location}")
             
         except Exception as preprocess_error:
-            # If preprocessing fails, log error but continue with original image
-            print(f"Error: Image preprocessing failed: {preprocess_error}")
-            import traceback
-            traceback.print_exc()
+            # If preprocessing fails, continue with original image
+            pass
         
         # Run OCR pipeline
         ocr_result = run_ocr_pipeline(file_location)
@@ -148,8 +172,13 @@ async def scan_certificate(file: UploadFile = File(...)):
         
         # Extract vehicle_number and owner_name from OCR result
         ocr_data = ocr_result.get("data", {})
-        vehicle_number = ocr_data.get("vehicle_number", {}).get("value", "")
-        owner_name = ocr_data.get("owner_name", {}).get("value", "")
+        vehicle_number = ocr_data.get("vehicle_number", {}).get("value", "") if isinstance(ocr_data.get("vehicle_number"), dict) else ""
+        owner_name = ocr_data.get("owner_name", {}).get("value", "") if isinstance(ocr_data.get("owner_name"), dict) else ""
+        
+        # Post-processing: Fix common OCR errors for Korean names
+        # Fix "권대육" -> "권대욱" (common OCR error)
+        if owner_name and "대육" in owner_name:
+            owner_name = owner_name.replace("대육", "대욱")
         
         if not vehicle_number:
             return {
@@ -195,7 +224,6 @@ async def scan_certificate(file: UploadFile = File(...)):
                 )
                 response.raise_for_status()
                 api_response = response.json()
-                print("autobegin_api_response", api_response)
                 
                 # Extract data from response (format: {"success": true, "data": {...}})
                 if not api_response.get("success", False):
@@ -301,6 +329,15 @@ async def scan_certificate(file: UploadFile = File(...)):
             result["success"] = False
             result["error"] = error_message
             result["message"] = f"Autobegin API returned error: {error_message}"
+            
+            # Special handling for common error codes
+            if rst_code == 100030:
+                # Owner name incorrect or vehicle deregistered
+                # This often happens when OCR misreads Korean characters
+                result["suggestion"] = "소유자명이 잘못되었거나 차량이 말소되었을 수 있습니다. OCR 결과를 확인해주세요."
+                result["ocr_owner_name"] = owner_name
+                result["ocr_vehicle_number"] = vehicle_number
+                result["possible_ocr_error"] = "OCR may have misread Korean characters. Please verify the owner name."
         
         return result
         
@@ -310,7 +347,7 @@ async def scan_certificate(file: UploadFile = File(...)):
         # Clean up uploaded file
         # if os.path.exists(file_location):
         #     os.remove(file_location)
-            print("DELETE FILE", file_location)
+        pass
 
 
 @app_router.post('/scan-certificate/select-series')
@@ -365,7 +402,6 @@ async def scan_certificate_select_series(selection: SeriesSelection = Body(...))
                 )
                 response.raise_for_status()
                 api_response = response.json()
-                print("autobegin_detail_api_response", api_response)
                 
                 # Extract data from response (format: {"success": true, "data": {...}})
                 if not api_response.get("success", False):

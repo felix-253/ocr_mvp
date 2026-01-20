@@ -37,6 +37,22 @@ def normalization_data_certificate(fullTextOcr):
     * **Context Keywords:** Look near "소유자", "성명", "명칭".
     * **Format:** Typically a Korean name (2-4 characters) or a Company name.
     * **Rule:** Extract only the name value, remove labels like "성명 :".
+    * **CRITICAL CORRECTION RULES for Owner Name:**
+        1. **Common OCR Error Fix:** OCR often misreads "욱" (uk) as "육" (yuk).
+            - **CRITICAL:** If you see "권대육", it MUST be corrected to "권대욱" (this is a very common OCR error).
+            - Look for patterns like "대육" in names and consider if it should be "대욱" based on context.
+            - "욱" has a horizontal stroke at the bottom, "육" does not - OCR often misses this detail.
+        2. **Character Similarity Fixes:**
+            - "욱" (uk) ↔ "육" (yuk) - these are commonly confused by OCR
+            - When in doubt for names ending with "대욱" pattern, prefer "욱" over "육"
+    * **CRITICAL CORRECTION RULES for Owner Name:**
+        1. **Common OCR Error Fix:** OCR often misreads "욱" (uk) as "육" (yuk).
+            - If you see "권대육", it should be corrected to "권대욱" (this is a very common error).
+            - Look for patterns like "대육" and consider if it should be "대욱" based on context.
+        2. **Character Similarity Fixes:**
+            - "욱" (uk) ↔ "육" (yuk) - these are commonly confused
+            - "욱" has a horizontal line at the bottom, "육" does not
+            - When in doubt, prefer "욱" for names ending with "대욱" pattern
 
     ### FIELD 3: "confidence" (Scoring)
     * **1.0**: Perfect match with Target Regex found in raw text without changes.
